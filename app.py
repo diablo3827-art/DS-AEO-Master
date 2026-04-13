@@ -6,14 +6,7 @@ import urllib.parse
 import os
 import google.generativeai as genai
 
-# Try loading API key from local file or streamlit secrets
-local_key_path = "GOOGLE_API_KEY.env"
-default_api_key = ""
-if os.path.exists(local_key_path):
-    with open(local_key_path, "r", encoding="utf-8") as f:
-        default_api_key = f.read().strip()
-elif "GEMINI_API_KEY" in st.secrets:
-    default_api_key = st.secrets["GEMINI_API_KEY"]
+# Keys will be loaded from st.secrets directly
 
 # Set up the page config
 st.set_page_config(page_title="DS AEO & Schema Master", layout="wide")
@@ -22,10 +15,8 @@ st.title("DS AEO & Schema Master (Gemini Powered)")
 
 # Sidebar for configuration
 with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input("Gemini API Key (Required)", value=default_api_key, type="password", help="Enter your Google Gemini API key to use LLM features.")
-    st.markdown("---")
-    st.markdown("**About**\n\nThis tool extracts text and Schema.org structured data from URLs and uses Gemini to generate 3-toned AEO optimized texts with Schema recommendations.")
+    st.header("⚙️ About")
+    st.markdown("This tool extracts text and Schema.org structured data from URLs and uses Gemini to generate 3-toned AEO optimized texts with Schema recommendations.\n\n*Note: The Gemini API Key is securely managed via Streamlit Secrets.*")
 
 # Main input section
 st.markdown("### Input Configurations")
@@ -39,8 +30,10 @@ if st.button("🚀 Start Analysis", type="primary"):
         st.warning("⚠️ Please enter at least one URL.")
         st.stop()
         
-    if not api_key:
-        st.warning("⚠️ Please provide your Gemini API key in the sidebar configuration.")
+    try:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    except KeyError:
+        st.error("⚠️ API key is missing. Please add GOOGLE_API_KEY to your Streamlit secrets (.streamlit/secrets.toml) or Cloud Settings!")
         st.stop()
         
     # Initialize Gemini Model
