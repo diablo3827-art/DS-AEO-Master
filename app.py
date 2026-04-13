@@ -93,6 +93,13 @@ def extract_json(text: str):
         return None
 
 
+class OpenRouterError(Exception):
+    """OpenRouter API 전용 에러 (requests.RequestException과 구별)"""
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def call_openrouter(prompt: str, model: str) -> str:
     """OpenRouter API 호출 (OpenAI 호환)"""
     headers = {
@@ -106,8 +113,19 @@ def call_openrouter(prompt: str, model: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 3000,
     }
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    except requests.exceptions.RequestException as e:
+        raise OpenRouterError(f"OpenRouter 네트워크 오류: {e}") from e
+
+    if not resp.ok:
+        try:
+            err_body = resp.json()
+            err_msg = err_body.get("error", {}).get("message", resp.text[:200])
+        except Exception:
+            err_msg = resp.text[:200]
+        raise OpenRouterError(f"HTTP {resp.status_code}: {err_msg}", status_code=resp.status_code)
+
     data = resp.json()
     return data["choices"][0]["message"]["content"]
 
@@ -145,14 +163,20 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
             try:
                 text = call_openrouter(prompt, or_model)
                 return text, f"OpenRouter · {or_model.split('/')[1].split(':')[0]}"
-            except Exception as e:
+            except OpenRouterError as e:
                 err = str(e)
-                if "429" in err or "quota" in err.lower() or "rate" in err.lower():
+                sc = e.status_code
+                if sc in (404, 422) or "not found" in err.lower():
+                    # 모델을 찾을 수 없음 → 다음 모델 시도
+                    quota_errors.append(f"OpenRouter/{or_model}: 모델 없음({sc})")
+                    continue
+                elif sc == 429 or "429" in err or "quota" in err.lower() or "rate" in err.lower():
                     quota_errors.append(f"OpenRouter/{or_model}: quota 초과")
                     time.sleep(0.3)
                     continue
                 else:
-                    raise e
+                    # 그 외 OpenRouter 에러는 RuntimeError로 래핑 (requests.RequestException 누출 방지)
+                    raise RuntimeError(f"OpenRouter 오류: {err}") from e
 
     # ── 모두 실패 ─────────────────────────────────
     errors_str = "\n".join(quota_errors)
@@ -190,18 +214,21 @@ if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
     else:
         for url in urls:
             st.markdown(f"### 🌐 분석 결과: [{url}]({url})")
+
+            # ── Step 1: 크롤링 (실패해도 AI 분석 계속) ─────────────
+            page_text = ""
+            current_schemas = []
+            crawl_ok = False
             try:
-                # ── Step 1: 크롤링 ──────────────────────────
                 with st.spinner("현재 페이지 데이터 수집 중..."):
-                    resp = requests.get(
+                    crawl_resp = requests.get(
                         url,
                         headers={"User-Agent": "Mozilla/5.0"},
                         timeout=10
                     )
-                    resp.raise_for_status()
-                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    crawl_resp.raise_for_status()
+                    soup = BeautifulSoup(crawl_resp.text, 'html.parser')
 
-                    current_schemas = []
                     for s in soup.find_all("script", type="application/ld+json"):
                         if s.string:
                             try:
@@ -212,19 +239,29 @@ if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
                     for tag in soup(["script", "style"]):
                         tag.extract()
                     page_text = soup.get_text(separator=' ', strip=True)[:3000]
+                    crawl_ok = True
 
-                col_c1, col_c2 = st.columns(2)
-                with col_c1:
-                    with st.expander("📄 현재 페이지 텍스트 (요약)", expanded=True):
+            except requests.exceptions.RequestException as req_err:
+                st.warning(f"⚠️ 페이지 크롤링 실패: {req_err}\n\nAI 분석은 URL 정보만으로 계속 진행합니다.")
+                page_text = f"(크롤링 불가 — URL: {url})"
+
+            # 크롤링 결과 표시
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                with st.expander("📄 현재 페이지 텍스트 (요약)", expanded=crawl_ok):
+                    if crawl_ok:
                         st.write(page_text[:500] + "...")
-                with col_c2:
-                    with st.expander("🧩 발견된 기존 스키마", expanded=True):
-                        if current_schemas:
-                            st.json(current_schemas)
-                        else:
-                            st.info("스키마 없음")
+                    else:
+                        st.info("크롤링 불가 — AI 분석은 계속 진행됩니다.")
+            with col_c2:
+                with st.expander("🧩 발견된 기존 스키마", expanded=crawl_ok):
+                    if current_schemas:
+                        st.json(current_schemas)
+                    else:
+                        st.info("스키마 없음")
 
-                # ── Step 2: AI 분석 ─────────────────────────
+            # ── Step 2: AI 분석 (별도 에러 처리) ──────────────────
+            try:
                 with st.spinner("AI가 AEO 전략 수립 중..."):
                     prompt = f"""
 URL: {url}
@@ -291,12 +328,10 @@ Return ONLY valid JSON (no markdown, no explanation):
                     with st.expander("원문 보기"):
                         st.text(raw_text[:3000] if raw_text else "응답 없음")
 
-            except RuntimeError as re_err:
-                st.error(str(re_err))
-            except requests.exceptions.RequestException as req_err:
-                st.error(f"🌐 URL 접근 오류: {str(req_err)}")
-            except Exception as e:
-                st.error(f"오류: {str(e)}")
+            except RuntimeError as ai_err:
+                st.error(str(ai_err))
+            except Exception as ai_ex:
+                st.error(f"AI 분석 오류: {str(ai_ex)}")
 
 st.markdown("---")
 st.markdown(
