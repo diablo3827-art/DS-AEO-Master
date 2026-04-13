@@ -5,64 +5,82 @@ import json
 import urllib.parse
 import google.generativeai as genai
 import re
+import time
 
+# ─────────────────────────────────────────────
 # 1. 페이지 설정
+# ─────────────────────────────────────────────
 st.set_page_config(page_title="DS AEO & Schema Master", layout="wide")
 
-# 2. 모델 설정 (Failsafe 자동 탐색 + 예외 처리 강화)
-MODEL_PRIORITY = [
+# ─────────────────────────────────────────────
+# 2. API 키 로드
+# ─────────────────────────────────────────────
+GOOGLE_API_KEY    = st.secrets.get("GOOGLE_API_KEY", "")
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
+
+# Gemini 모델 우선순위
+GEMINI_MODELS = [
     "models/gemini-1.5-flash",
+    "models/gemini-2.0-flash-lite",
     "models/gemini-2.0-flash",
     "models/gemini-1.5-pro",
-    "models/gemini-pro",
 ]
 
-@st.cache_resource
-def load_model(api_key):
-    if not api_key:
-        return None, "API 키가 없습니다. Streamlit Secrets에서 GOOGLE_API_KEY를 설정하세요."
-    try:
-        genai.configure(api_key=api_key)
-        try:
-            available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        except Exception:
-            available = MODEL_PRIORITY  # list_models 실패 시 전체 시도
+# OpenRouter 무료 모델 우선순위 (:free 접미사 필수)
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+]
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-        for target in MODEL_PRIORITY:
-            if target in available:
-                try:
-                    m = genai.GenerativeModel(target)
-                    # 간단한 ping으로 유효성 확인
-                    m.generate_content("Hi", generation_config={"max_output_tokens": 5})
-                    return m, target
-                except Exception as ping_err:
-                    err_str = str(ping_err)
-                    if "429" in err_str or "quota" in err_str.lower():
-                        continue  # 다음 모델 시도
-                    # 그 외 에러는 모델 자체는 유효하다고 판단하고 반환
-                    return m, target
-        return None, "사용 가능한 모델이 없습니다 (모든 모델 할당량 초과)."
-    except Exception as e:
-        return None, str(e)
-
-api_key = st.secrets.get("GOOGLE_API_KEY", "")
-model, active_model = load_model(api_key)
-
-# 3. 사이드바 및 상태 표시
+# ─────────────────────────────────────────────
+# 3. 사이드바
+# ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ System")
-    if model:
-        st.success(f"🟢 {active_model} 가동 중")
+
+    gemini_ok = bool(GOOGLE_API_KEY)
+    openrouter_ok = bool(OPENROUTER_API_KEY)
+
+    if gemini_ok:
+        st.success("🟢 Gemini API 연결됨")
     else:
-        st.error(f"🔴 {active_model}")
+        st.warning("🟡 Gemini API 키 없음")
+
+    if openrouter_ok:
+        st.success("🟢 OpenRouter API 연결됨 (백업)")
+    else:
+        st.info("⚪ OpenRouter 미설정 (선택사항)")
+
+    if not gemini_ok and not openrouter_ok:
+        st.error("🔴 API 키가 하나도 없습니다. Secrets를 설정하세요.")
         st.stop()
 
-# 4. 입력 섹션
-st.title("DS AEO & Schema Master")
-urls_input = st.text_area("Target URLs", height=80, placeholder="(검색하고 싶은 URL 주소를 복사해서 붙여넣기 해주세요)")
-context_input = st.text_area("Context Details (강조할 키워드/의도)", placeholder="예: 클래시스, 볼뉴머, 6.78MHz 고주파, 안전한 리프팅")
+    st.markdown("---")
+    with st.expander("🔑 API 키 설정 방법", expanded=False):
+        st.markdown("""
+**Streamlit Secrets** (`.streamlit/secrets.toml`) 에 추가:
 
-def extract_json(text):
+```toml
+GOOGLE_API_KEY = "AIza..."
+OPENROUTER_API_KEY = "sk-or-..."
+```
+
+**OpenRouter 무료 키 발급:**
+1. [openrouter.ai](https://openrouter.ai) 회원가입
+2. API Keys → Create Key
+3. 무료 모델은 하루 50회 사용 가능
+""")
+
+    st.markdown("**모델 우선 순위**")
+    st.caption("Gemini → OpenRouter 순으로 자동 전환")
+
+# ─────────────────────────────────────────────
+# 4. 유틸 함수
+# ─────────────────────────────────────────────
+def extract_json(text: str):
     try:
         text = re.sub(r'```json\s?|\s?```', '', text).strip()
         start, end = text.find('{'), text.rfind('}')
@@ -72,50 +90,97 @@ def extract_json(text):
     except Exception:
         return None
 
-def generate_with_fallback(prompt):
-    """Quota 초과 시 다른 모델로 자동 fallback"""
-    global model, active_model
-    
-    # 현재 모델로 먼저 시도
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        err_str = str(e)
-        if "429" not in err_str and "quota" not in err_str.lower():
-            raise e  # quota 에러가 아니면 그대로 raise
 
-    # Quota 초과: 다른 모델로 fallback
-    st.warning(f"⚠️ {active_model} 할당량 초과. 다른 모델로 전환 중...")
-    genai.configure(api_key=api_key)
-    
-    try:
-        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    except Exception:
-        available = MODEL_PRIORITY
+def call_openrouter(prompt: str, model: str) -> str:
+    """OpenRouter API 호출 (OpenAI 호환)"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ds-aeo-master.streamlit.app",
+        "X-Title": "DS AEO & Schema Master",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 3000,
+    }
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
-    for target in MODEL_PRIORITY:
-        if target == active_model:
-            continue  # 이미 실패한 모델 건너뜀
-        if target not in available:
-            continue
-        try:
-            fallback_model = genai.GenerativeModel(target)
-            response = fallback_model.generate_content(prompt)
-            # 성공 시 전역 모델 교체
-            model = fallback_model
-            active_model = target
-            st.sidebar.success(f"🟢 {active_model} 전환 완료")
-            return response.text
-        except Exception as inner_e:
-            inner_str = str(inner_e)
-            if "429" in inner_str or "quota" in inner_str.lower():
-                continue
-            raise inner_e
 
-    raise RuntimeError("모든 Gemini 모델의 할당량이 초과되었습니다. 잠시 후 다시 시도해주세요.")
+def generate_with_fallback(prompt: str) -> tuple[str, str]:
+    """
+    1) Gemini 모델 순서대로 시도
+    2) 모두 Quota 초과 시 OpenRouter 무료 모델로 자동 fallback
+    반환: (응답 텍스트, 사용된 모델명)
+    """
+    quota_errors = []
 
-# 5. 실행 로직
+    # ── Gemini 시도 ──────────────────────────────
+    if GOOGLE_API_KEY:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        for model_name in GEMINI_MODELS:
+            try:
+                m = genai.GenerativeModel(model_name)
+                response = m.generate_content(prompt)
+                return response.text, f"Gemini · {model_name.replace('models/', '')}"
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "quota" in err.lower() or "exhausted" in err.lower():
+                    quota_errors.append(f"Gemini/{model_name.replace('models/', '')}: quota 초과")
+                    time.sleep(0.3)
+                    continue
+                elif "not found" in err.lower() or "404" in err:
+                    continue
+                else:
+                    raise e
+
+    # ── OpenRouter fallback ───────────────────────
+    if OPENROUTER_API_KEY:
+        for or_model in OPENROUTER_MODELS:
+            try:
+                text = call_openrouter(prompt, or_model)
+                return text, f"OpenRouter · {or_model.split('/')[1].split(':')[0]}"
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "quota" in err.lower() or "rate" in err.lower():
+                    quota_errors.append(f"OpenRouter/{or_model}: quota 초과")
+                    time.sleep(0.3)
+                    continue
+                else:
+                    raise e
+
+    # ── 모두 실패 ─────────────────────────────────
+    errors_str = "\n".join(quota_errors)
+    raise RuntimeError(
+        f"모든 AI 모델의 할당량이 초과되었습니다.\n\n"
+        f"**시도한 모델:**\n{errors_str}\n\n"
+        f"**해결 방법:**\n"
+        f"1. 잠시 후 재시도 (무료 quota는 분/일 단위 초기화)\n"
+        f"2. [OpenRouter](https://openrouter.ai) 무료 API 키 발급 후 Secrets에 추가\n"
+        f"3. [Google AI Studio](https://aistudio.google.com/app/apikey) 에서 새 Gemini 키 발급"
+    )
+
+
+# ─────────────────────────────────────────────
+# 5. 메인 UI
+# ─────────────────────────────────────────────
+st.title("DS AEO & Schema Master")
+urls_input = st.text_area(
+    "Target URLs",
+    height=80,
+    placeholder="분석할 URL 주소를 한 줄에 하나씩 입력하세요"
+)
+context_input = st.text_area(
+    "Context Details (강조할 키워드/의도)",
+    placeholder="예: 클래시스, 볼뉴머, 6.78MHz 고주파, 안전한 리프팅"
+)
+
+# ─────────────────────────────────────────────
+# 6. 실행
+# ─────────────────────────────────────────────
 if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
     urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
     if not urls:
@@ -124,28 +189,28 @@ if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
         for url in urls:
             st.markdown(f"### 🌐 분석 결과: [{url}]({url})")
             try:
-                # [Step 1] 크롤링 및 기존 데이터 노출
+                # ── Step 1: 크롤링 ──────────────────────────
                 with st.spinner("현재 페이지 데이터 수집 중..."):
-                    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                    resp = requests.get(
+                        url,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=10
+                    )
                     resp.raise_for_status()
                     soup = BeautifulSoup(resp.text, 'html.parser')
 
-                    # 스키마 추출
-                    scripts = soup.find_all("script", type="application/ld+json")
                     current_schemas = []
-                    for s in scripts:
+                    for s in soup.find_all("script", type="application/ld+json"):
                         if s.string:
                             try:
                                 current_schemas.append(json.loads(s.string, strict=False))
                             except json.JSONDecodeError:
                                 pass
 
-                    # 텍스트 추출
                     for tag in soup(["script", "style"]):
                         tag.extract()
                     page_text = soup.get_text(separator=' ', strip=True)[:3000]
 
-                # 크롤링 내용 선노출
                 col_c1, col_c2 = st.columns(2)
                 with col_c1:
                     with st.expander("📄 현재 페이지 텍스트 (요약)", expanded=True):
@@ -157,34 +222,35 @@ if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
                         else:
                             st.info("스키마 없음")
 
-                # [Step 2] AI 분석 (정석, 신뢰, 트렌드)
-                with st.spinner("Gemini AI가 AEO 전략 수립 중..."):
+                # ── Step 2: AI 분석 ─────────────────────────
+                with st.spinner("AI가 AEO 전략 수립 중..."):
                     prompt = f"""
-                    URL: {url}
-                    Context: {context_input}
-                    Page Text: {page_text}
-                    
-                    Task: Generate AEO optimization contents in 3 Tones:
-                    1. '정석 타입' (Formal, SEO-standard, Classic)
-                    2. '신뢰 타입' (Expert, Authoritative, Trustworthy)
-                    3. '글로벌 트렌드' (Trendy, Modern, Global Trend)
+URL: {url}
+Context: {context_input}
+Page Text: {page_text}
 
-                    Requirements:
-                    - Provide content in both Korean (ko) and English (en).
-                    - Recommend a Schema.org type and JSON-LD code for each.
-                    - Provide a 'searchQuery' for testing.
+Task: Generate AEO optimization contents in 3 Tones:
+1. '정석 타입' (Formal, SEO-standard, Classic)
+2. '신뢰 타입' (Expert, Authoritative, Trustworthy)
+3. '글로벌 트렌드' (Trendy, Modern, Global Trend)
 
-                    Return ONLY valid JSON (no markdown, no explanation):
-                    {{
-                      "정석 타입": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}},
-                      "신뢰 타입": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}},
-                      "글로벌 트렌드": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}}
-                    }}
-                    """
-                    raw_text = generate_with_fallback(prompt)
+Requirements:
+- Provide content in both Korean (ko) and English (en).
+- Recommend a Schema.org type and JSON-LD code for each.
+- Provide a 'searchQuery' for testing.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "정석 타입": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}},
+  "신뢰 타입": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}},
+  "글로벌 트렌드": {{"ko": "...", "en": "...", "schema": "...", "code": {{}}, "query": "..."}}
+}}
+"""
+                    raw_text, used_model = generate_with_fallback(prompt)
+                    st.caption(f"✅ 사용 모델: `{used_model}`")
                     result = extract_json(raw_text)
 
-                # [Step 3] 결과 디스플레이
+                # ── Step 3: 결과 표시 ───────────────────────
                 if result:
                     st.markdown("#### 💡 AEO 전략 제안")
                     t_cols = st.columns(3)
@@ -214,21 +280,24 @@ if st.button("🚀 데이터 추출 및 AEO 분석 시작", type="primary"):
                             q = data.get('query', '')
                             if q:
                                 st.link_button(
-                                    f"🔍 '{q}' 테스트",
+                                    f"🔍 '{q}' Genspark 검색",
                                     f"https://www.genspark.ai/search?query={urllib.parse.quote(q)}",
                                     use_container_width=True
                                 )
                 else:
-                    st.error("AI 분석 결과 파싱 실패. 응답 원문:")
+                    st.error("AI 응답 파싱 실패. 원문을 확인하세요.")
                     with st.expander("원문 보기"):
-                        st.text(raw_text[:2000] if 'raw_text' in dir() else "응답 없음")
+                        st.text(raw_text[:3000] if raw_text else "응답 없음")
 
             except RuntimeError as re_err:
-                st.error(f"🚫 {str(re_err)}")
+                st.error(str(re_err))
             except requests.exceptions.RequestException as req_err:
                 st.error(f"🌐 URL 접근 오류: {str(req_err)}")
             except Exception as e:
                 st.error(f"오류: {str(e)}")
 
 st.markdown("---")
-st.markdown("<div style='text-align: center; color: gray;'>Digital AI Alchemist DS - VAIB-X Team</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div style='text-align: center; color: gray;'>Digital AI Alchemist DS - VAIB-X Team</div>",
+    unsafe_allow_html=True
+)
