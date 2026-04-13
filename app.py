@@ -9,60 +9,64 @@ import re
 # 1. 페이지 설정
 st.set_page_config(page_title="DS AEO & Schema Master", layout="wide")
 
-# 2. 모델 진단 및 설정
-def get_working_model():
-    if "GOOGLE_API_KEY" not in st.secrets:
-        st.error("❌ Streamlit Secrets에 'GOOGLE_API_KEY'가 설정되지 않았습니다.")
-        return None, "Secrets Missing"
+# 2. 모델 설정 (지능형 자동 선택 로직)
+@st.cache_resource
+def get_best_model(api_key):
+    try:
+        genai.configure(api_key=api_key)
+        # 1단계: 현재 API 키로 접근 가능한 모든 모델 리스트 확보
+        available_models = [m.name for m in genai.list_models() 
+                           if 'generateContent' in m.supported_generation_methods]
+        
+        # 2단계: 선호 순위 리스트 (2026 표준)
+        preference = [
+            "models/gemini-3-flash", 
+            "models/gemini-1.5-flash", 
+            "models/gemini-2.0-flash", 
+            "models/gemini-pro"
+        ]
+        
+        # 3단계: 매칭되는 첫 번째 모델 선택
+        for target in preference:
+            if target in available_models:
+                return genai.GenerativeModel(target), target
+        
+        # 4단계: 매칭되는 게 없으면 목록의 첫 번째 모델이라도 반환
+        if available_models:
+            return genai.GenerativeModel(available_models[0]), available_models[0]
+        return None, None
+    except Exception as e:
+        return None, str(e)
 
-    api_key = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=api_key)
-    
-    # 시도해볼 모델 후보군 (2026 표준)
-    candidates = ["gemini-3-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    errors = []
+# 초기화 실행
+if "GOOGLE_API_KEY" not in st.secrets:
+    st.error("❌ Secrets에 'GOOGLE_API_KEY'가 없습니다!")
+    st.stop()
 
-    for name in candidates:
-        try:
-            m = genai.GenerativeModel(name)
-            # 핑 테스트
-            m.generate_content("test", generation_config={"max_output_tokens": 1})
-            return m, None
-        except Exception as e:
-            errors.append(f"{name}: {str(e)}")
-            continue
-            
-    return None, errors
+model, model_name = get_best_model(st.secrets["GOOGLE_API_KEY"])
 
-model, debug_errors = get_working_model()
-
-# 사이드바에 진단 정보 표시
+# 사이드바 상태 표시
 with st.sidebar:
     st.header("⚙️ System Status")
     if model:
-        st.success(f"🤖 가동 중: {model.model_name}")
+        st.success(f"🤖 가동 모델: {model_name}")
     else:
-        st.error("❌ 모델 연결 실패")
-        with st.expander("상세 에러 로그 확인"):
-            for err in debug_errors:
-                st.write(err)
-    st.info("🔒 API Key는 Secrets 금고에서 관리 중")
+        st.error(f"❌ 모델 찾기 실패: {model_name}")
+        st.stop()
+    st.info("🔒 API Key 보안 가동 중")
 
-if not model:
-    st.stop()
-
-# 3. JSON 추출 및 메인 로직 (이전과 동일, 안정화 버전)
+# 3. JSON 정밀 추출 함수
 def extract_clean_json(text):
     try:
         text = re.sub(r'```json\s?|\s?```', '', text).strip()
-        start_idx = text.find('{')
-        end_idx = text.rfind('}')
-        if start_idx != -1 and end_idx != -1:
-            json_str = text[start_idx:end_idx+1]
-            return json.loads(json_str)
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
         return None
     except: return None
 
+# 4. 메인 UI
 st.title("DS AEO & Schema Master (Gemini Powered)")
 st.markdown("### Input Configurations")
 
@@ -78,14 +82,16 @@ if st.button("🚀 Start Analysis", type="primary"):
             st.markdown("---")
             st.subheader(f"🌐 Analysis for: {url}")
             try:
-                with st.spinner("AI 분석 중..."):
+                with st.spinner(f"{model_name} 분석 엔진 가동 중..."):
+                    # 크롤링
                     resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                     resp.raise_for_status()
                     soup = BeautifulSoup(resp.text, 'html.parser')
                     for s in soup(["script", "style"]): s.extract()
                     page_text = soup.get_text(separator=' ', strip=True)[:3000]
 
-                    prompt = f"Analyze and return JSON for: {page_text}\nContext: {context_input}"
+                    # AI 분석
+                    prompt = f"Scraped Text: {page_text}\nContext: {context_input}\nGenerate 3-toned AEO texts and return ONLY JSON."
                     response = model.generate_content(prompt)
                     result = extract_clean_json(response.text)
                     
@@ -96,13 +102,13 @@ if st.button("🚀 Start Analysis", type="primary"):
                             with cols[i]:
                                 st.markdown(f"#### 🎭 {tone}")
                                 data = result.get(tone, {})
-                                st.info(data.get('text', '생성 실패'))
+                                st.info(data.get('text', '내용 생성 실패'))
                                 q = data.get('searchQuery', '')
                                 st.link_button(f"🔍 '{q}' 테스트", f"https://www.genspark.ai/search?query={urllib.parse.quote(q)}", use_container_width=True)
                     else:
-                        st.error("AI 응답 파싱 실패")
+                        st.error("AI 응답 형식이 올바르지 않습니다.")
             except Exception as e:
-                st.error(f"❌ 오류: {str(e)}")
+                st.error(f"❌ 분석 오류: {str(e)}")
 
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: gray;'>Developed by DS - VAIB-X Team Leader</div>", unsafe_allow_html=True)
