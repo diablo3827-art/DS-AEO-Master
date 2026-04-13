@@ -59,8 +59,10 @@ with st.sidebar:
         st.stop()
 
     st.markdown("---")
-    with st.expander("🔑 API 키 설정 방법", expanded=False):
-        st.markdown("""
+    # 키가 하나라도 없을 때만 설정 안내 노출
+    if not gemini_ok or not openrouter_ok:
+        with st.expander("🔑 API 키 설정 방법", expanded=not gemini_ok):
+            st.markdown("""
 **Streamlit Secrets** (`.streamlit/secrets.toml`) 에 추가:
 
 ```toml
